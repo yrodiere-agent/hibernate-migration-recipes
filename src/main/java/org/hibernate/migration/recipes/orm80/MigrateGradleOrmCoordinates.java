@@ -7,7 +7,7 @@ import org.openrewrite.groovy.tree.G;
 import org.openrewrite.java.JavaIsoVisitor;
 import org.openrewrite.java.tree.*;
 import org.openrewrite.kotlin.tree.K;
-import org.openrewrite.maven.tree.MavenRepository;
+
 import org.openrewrite.toml.tree.Toml;
 
 import java.nio.file.Path;
@@ -30,13 +30,12 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
     // Relocated coordinates can expose declarations to earlier aggregate recipes.
     @Override public boolean causesAnotherCycle() { return true; }
     @Override public @NonNull String getDisplayName() { return "Migrate Gradle ORM coordinates"; }
-    @Override public @NonNull String getDescription() { return "Relocates allowlisted ORM declarations, aligns plugins/processors, and adds the Hibernate platform in Gradle scripts and local catalogs."; }
+    @Override public @NonNull String getDescription() { return "Relocates allowlisted ORM declarations and aligns plugins/processors in Gradle scripts and local catalogs."; }
     @Override public @NonNull Validated<Object> validate() { return super.validate().and(OrmCoordinateSupport.validate(targetVersion)); }
     static final class Plan {
         final Map<Path, SourceFile> scripts = new LinkedHashMap<>();
         final Map<Path, GradleOrmCatalog> catalogs = new LinkedHashMap<>();
         final Map<Path, List<CoordinateSourceEdits.Edit>> edits = new HashMap<>();
-        final Set<Declaration> managedConsumers = new HashSet<>();
         final Set<GradleOrmCatalog.Entry> blockedEntries = new HashSet<>();
         boolean ready;
     }
@@ -81,23 +80,13 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
             if (!processed.add(source.getSourcePath() + ":" + source.getId())) continue;
             scripts.add(inspect(source, plan));
         }
-        boolean libraries = scripts.stream().flatMap(s -> s.declarations.stream()).anyMatch(d -> d.role.equals("library"))
-                || plan.catalogs.values().stream().filter(c -> !c.names.isEmpty()).flatMap(c -> c.entries.stream()).anyMatch(e -> e.role().equals("library") && target(e.group(), e.artifact()) != null);
-        List<MavenRepository> repositories = repositories(plan);
-        Set<String> covered = libraries ? managed(targetVersion, repositories, ctx) : Set.of();
         Map<GradleOrmCatalog.Entry, List<Declaration>> consumers = new HashMap<>();
-        Set<GradleOrmCatalog.Entry> omitted = new HashSet<>();
         for (Script script : scripts) for (Declaration declaration : script.declarations)
             if (declaration.entry != null) consumers.computeIfAbsent(declaration.entry, k -> new ArrayList<>()).add(declaration);
-        for (Script script : scripts) migrateScript(script, covered, consumers, plan, ctx);
+        for (Script script : scripts) migrateScript(script, consumers, plan, ctx);
         for (GradleOrmCatalog catalog : plan.catalogs.values()) {
-            for (var entry : catalog.entries) {
-                List<Declaration> uses = consumers.getOrDefault(entry, List.of());
-                if (!uses.isEmpty() && uses.stream().allMatch(plan.managedConsumers::contains)
-                        && completeConsumers(catalog, entry, scripts, plan)) omitted.add(entry);
-            }
             if (catalog.names.isEmpty() || !processed.add(catalog.source.getSourcePath() + ":" + catalog.source.getId())) continue;
-            migrateCatalog(catalog, omitted, consumers, plan, ctx);
+            migrateCatalog(catalog, consumers, plan, ctx);
         }
     }
 
@@ -130,19 +119,6 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
                 }
             }.visit(source, 0);
         }
-    }
-    private static List<MavenRepository> repositories(Plan plan) {
-        List<MavenRepository> repositories = new ArrayList<>();
-        for (SourceFile source : plan.scripts.values()) new JavaIsoVisitor<Integer>() {
-            @Override public J.MethodInvocation visitMethodInvocation(J.MethodInvocation call, Integer p) {
-                if (call.getSimpleName().equals("url") || call.getSimpleName().equals("maven"))
-                    for (Expression arg : call.getArguments()) if (arg instanceof J.Literal literal && literal.getValue() instanceof String s
-                            && (s.startsWith("https://") || s.startsWith("file:")))
-                        repositories.add(MavenRepository.builder().id("gradle-" + repositories.size()).uri(s).releases("true").snapshots("true").build());
-                return super.visitMethodInvocation(call, p);
-            }
-        }.visit(source, 0);
-        return repositories;
     }
     private static Script inspect(SourceFile source, Plan plan) {
         List<Declaration> declarations = new ArrayList<>();
@@ -319,7 +295,7 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
         return "";
     }
 
-    private void migrateScript(Script script, Set<String> covered, Map<GradleOrmCatalog.Entry, List<Declaration>> consumers, Plan plan, ExecutionContext ctx) {
+    private void migrateScript(Script script, Map<GradleOrmCatalog.Entry, List<Declaration>> consumers, Plan plan, ExecutionContext ctx) {
         List<CoordinateSourceEdits.Edit> edits = plan.edits.computeIfAbsent(script.source.getSourcePath(), k -> new ArrayList<>());
         Set<Declaration> redundant = new HashSet<>(), entityConflicts = new HashSet<>();
         for (Declaration entity : script.declarations) if (entityManager(entity.artifact)) {
@@ -345,7 +321,6 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
                 if (artifact != null && !d.role.equals("platform") && !redundant.contains(d)) counts.merge(d.role + ":" + artifact, 1L, Long::sum);
             }
             Set<UUID> handled = new HashSet<>();
-            boolean addPlatform = false;
             for (Declaration d : declarations) {
                 String artifact = d.role.equals("plugin") ? GROUP : target(d.group, d.artifact);
                 String reason = null;
@@ -369,39 +344,18 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
                     edits.add(new CoordinateSourceEdits.Edit(offset, end, retainedComments(script.source, d.call)));
                     continue;
                 }
-                boolean library = d.role.equals("library") && !TOOLING.contains(artifact);
-                boolean omit = library && !conflict && covered.contains(artifact);
-                if (library && !conflict) addPlatform = true;
-                if (library && !omit) report(this, skipped, script.source, offset, GROUP + ":" + artifact, MANAGEMENT,
-                        "Coordinates aligned; explicit version retained because platform coverage could not be verified.", ctx);
-                if (d.entry != null) { if (omit) plan.managedConsumers.add(d); continue; }
+                if (d.entry != null) continue;
                 if (!handled.add(d.call.getId())) continue;
                 String old = CoordinateSourceEdits.printed(script.source, d.call);
-                String updated = replaceDeclaration(script.source, d, artifact, omit, old, script.safeVersions.keySet());
+                String updated = replaceDeclaration(script.source, d, artifact, false, old, script.safeVersions.keySet());
                 String reference = versionReference(script.source, d);
-                if (!omit && script.safeVersions.containsKey(reference)) {
+                if (script.safeVersions.containsKey(reference)) {
                     J.Literal literal = script.safeVersions.get(reference);
                     int position = script.positions.get(literal.getId());
                     String value = CoordinateSourceEdits.printed(script.source, literal);
                     edits.add(new CoordinateSourceEdits.Edit(position, position + value.length(), quote(value, targetVersion)));
                 }
                 if (!updated.equals(old)) edits.add(new CoordinateSourceEdits.Edit(offset, offset + old.length(), updated));
-            }
-            if (addPlatform && platforms.isEmpty()) {
-                Declaration first = declarations.stream().filter(d -> d.role.equals("library") && d.supported).findFirst().orElseThrow();
-                String block = CoordinateSourceEdits.printed(script.source, first.block);
-                int close = script.positions.get(first.block.getId()) + block.lastIndexOf('}');
-                String newline = script.source.printAll().contains("\r\n") ? "\r\n" : "\n";
-                String before = script.source.printAll().substring(0, close);
-                int last = before.lastIndexOf('\n');
-                String closingIndent = last >= 0 ? before.substring(last + 1) : "";
-                if (!closingIndent.isBlank()) closingIndent = "";
-                String callPrefix = first.call.getPrefix().getWhitespace();
-                String indent = callPrefix.contains("\n") ? callPrefix.substring(callPrefix.lastIndexOf('\n') + 1) : "    ";
-                String inserted = first.configuration + "(platform(\"" + GROUP + ":" + PLATFORM + ":" + targetVersion + "\"))";
-                String text = block.contains("\n") ? indent.substring(Math.min(indent.length(), closingIndent.length())) + inserted + newline + closingIndent
-                        : "; " + inserted + " ";
-                edits.add(new CoordinateSourceEdits.Edit(close, close, text));
             }
         }
     }
@@ -509,59 +463,7 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
         return source.substring(0, offset) + value + source.substring(offset + old.length());
     }
 
-    private static boolean completeConsumers(GradleOrmCatalog catalog, GradleOrmCatalog.Entry entry, List<Script> scripts, Plan plan) {
-        Path catalogParent = catalog.source.getSourcePath().getParent();
-        Path root = catalogParent == null ? Path.of("") : catalogParent.getParent();
-        if (root == null) root = Path.of("");
-        final Path buildRoot = root;
-        SourceFile settings = plan.scripts.values().stream().filter(s -> s.getSourcePath().getFileName().toString().startsWith("settings")
-                && Objects.equals(s.getSourcePath().getParent(), buildRoot.toString().isEmpty() ? null : buildRoot)).findFirst().orElse(null);
-        if (settings == null) return false;
-        Set<Path> required = new HashSet<>(); required.add(buildRoot);
-        boolean[] unknown = {false};
-        new JavaIsoVisitor<Integer>() {
-            @Override public J.MethodInvocation visitMethodInvocation(J.MethodInvocation call, Integer p) {
-                if (Set.of("include", "includeFlat", "includeBuild").contains(call.getSimpleName())) {
-                    if (!call.getSimpleName().equals("include")) unknown[0] = true;
-                    else for (Expression arg : call.getArguments()) {
-                        if (arg instanceof J.Literal literal && literal.getValue() instanceof String name)
-                            required.add(buildRoot.resolve(name.replaceFirst("^:", "").replace(':', '/')));
-                        else unknown[0] = true;
-                    }
-                }
-                return super.visitMethodInvocation(call, p);
-            }
-            @Override public J.Assignment visitAssignment(J.Assignment assignment, Integer p) {
-                if (assignment.getVariable().printTrimmed().contains("projectDir")) unknown[0] = true;
-                return super.visitAssignment(assignment, p);
-            }
-        }.visit(settings, 0);
-        if (unknown[0]) return false;
-        Set<Path> supplied = new HashSet<>();
-        for (Script script : scripts) supplied.add(script.source.getSourcePath().getParent() == null ? Path.of("") : script.source.getSourcePath().getParent());
-        if (!supplied.containsAll(required)) return false;
-        for (Script script : scripts) {
-            int[] reads = {0};
-            new JavaIsoVisitor<Integer>() {
-                @Override public J.FieldAccess visitFieldAccess(J.FieldAccess access, Integer p) {
-                    String printed = access.printTrimmed();
-                    for (String name : catalog.names) {
-                        if (printed.equals(name + "." + entry.alias())) reads[0]++;
-                        if (printed.startsWith(name + ".bundles.")) {
-                            var members = catalog.bundles.getOrDefault(printed.substring((name + ".bundles.").length()), List.of());
-                            if (members.stream().anyMatch(m -> GradleOrmCatalog.accessor(m).equals(entry.alias()))) reads[0]++;
-                        }
-                    }
-                    return super.visitFieldAccess(access, p);
-                }
-            }.visit(script.source, 0);
-            long recognized = script.declarations.stream().filter(d -> entry.equals(d.entry)).count();
-            if (reads[0] != recognized) return false;
-        }
-        return true;
-    }
-
-    private void migrateCatalog(GradleOrmCatalog catalog, Set<GradleOrmCatalog.Entry> omitted,
+    private void migrateCatalog(GradleOrmCatalog catalog,
             Map<GradleOrmCatalog.Entry, List<Declaration>> consumers, Plan plan, ExecutionContext ctx) {
         List<CoordinateSourceEdits.Edit> edits = plan.edits.computeIfAbsent(catalog.source.getSourcePath(), k -> new ArrayList<>());
         Map<String, String> safeReferences = new HashMap<>();
@@ -573,7 +475,7 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
         Set<UUID> versionIds = new HashSet<>(); Map<UUID, Toml.KeyValue> versionFields = new HashMap<>();
         for (var value : catalog.source.getValues()) if (value instanceof Toml.Table table && table.getName() != null && table.getName().getName().equals("versions"))
             for (Toml tree : table.getValues()) if (tree instanceof Toml.KeyValue kv && safeReferences.containsKey(GradleOrmCatalog.key(kv))
-                    && catalog.entries.stream().anyMatch(e -> e.reference().equals(GradleOrmCatalog.key(kv)) && !omitted.contains(e))) {
+                    && catalog.entries.stream().anyMatch(e -> e.reference().equals(GradleOrmCatalog.key(kv)))) {
                 versionIds.add(kv.getId()); versionFields.put(kv.getId(), kv);
             }
         var versionPositions = CoordinateSourceEdits.offsets(catalog.source, versionIds);
@@ -593,7 +495,7 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
                     "Resolve this catalog declaration manually before migration.", ctx); continue; }
             String old = CoordinateSourceEdits.printed(catalog.source, entry.tree()); String updated = old;
             if (entry.tree().getValue() instanceof Toml.Literal) {
-                updated = replacePart(old, CoordinateSourceEdits.printed(catalog.source, entry.tree().getValue()), quote(CoordinateSourceEdits.printed(catalog.source, entry.tree().getValue()), GROUP + ":" + artifact + (omitted.contains(entry) ? "" : ":" + targetVersion)));
+                updated = replacePart(old, CoordinateSourceEdits.printed(catalog.source, entry.tree().getValue()), quote(CoordinateSourceEdits.printed(catalog.source, entry.tree().getValue()), GROUP + ":" + artifact + ":" + targetVersion));
             }
             else {
                 for (String field : List.of("module", "group", "name")) if (entry.fields().containsKey(field) && !plugin) {
@@ -601,18 +503,7 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
                     String replacement = field.equals("module") ? GROUP + ":" + artifact : field.equals("group") ? GROUP : artifact;
                     updated = replacePart(updated, CoordinateSourceEdits.printed(catalog.source, value), quote(CoordinateSourceEdits.printed(catalog.source, value), replacement));
                 }
-                if (omitted.contains(entry)) {
-                    String field = entry.fields().containsKey("version.ref") ? "version.ref" : "version";
-                    if (entry.fields().containsKey(field)) {
-                        String member = CoordinateSourceEdits.printed(catalog.source, entry.fields().get(field));
-                        int start = updated.indexOf(member), end = start + member.length();
-                        int comma = start - 1; while (comma >= 0 && Character.isWhitespace(updated.charAt(comma))) comma--;
-                        if (comma >= 0 && updated.charAt(comma) == ',') start = comma;
-                        else { while (end < updated.length() && Character.isWhitespace(updated.charAt(end))) end++; if (end < updated.length() && updated.charAt(end) == ',') end++; }
-                        updated = updated.substring(0, start) + updated.substring(end);
-                    }
-                }
-                else if (entry.reference().isEmpty() || !safeReferences.containsKey(entry.reference())) {
+                if (entry.reference().isEmpty() || !safeReferences.containsKey(entry.reference())) {
                     String field = entry.fields().containsKey("version.ref") ? "version.ref" : "version";
                     if (entry.fields().containsKey(field)) {
                         var member = entry.fields().get(field);
@@ -625,8 +516,6 @@ public class MigrateGradleOrmCoordinates extends ScanningRecipe<MigrateGradleOrm
                 }
             }
             if (!updated.equals(old)) edits.add(new CoordinateSourceEdits.Edit(offset, offset + old.length(), updated));
-            if (!plugin && !TOOLING.contains(artifact) && !PLATFORM.equals(artifact) && !omitted.contains(entry)) report(this, skipped, catalog.source, offset, GROUP + ":" + artifact, MANAGEMENT,
-                    "Catalog coordinates aligned; explicit version retained because complete consumer platform coverage could not be verified.", ctx);
         }
     }
 }

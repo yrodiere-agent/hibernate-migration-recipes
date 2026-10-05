@@ -24,7 +24,7 @@ final class OrmCoordinateSupport {
     static final String CONFLICT = "ORM_COORDINATE_CONFLICT";
     static final String VERSION = "ORM_COORDINATE_VERSION_UNRESOLVED";
     static final String SYNTAX = "ORM_COORDINATE_SYNTAX_UNSUPPORTED";
-    static final String MANAGEMENT = "ORM_PLATFORM_MANAGEMENT_UNVERIFIED";
+
     static final Set<String> CANONICAL = Set.of("hibernate-core", "hibernate-testing", "hibernate-dialect-testkit",
             "hibernate-envers", "hibernate-spatial", "hibernate-vector", "hibernate-community-dialects", "hibernate-scan-jandex",
             "hibernate-agroal", "hibernate-c3p0", "hibernate-hikaricp", "hibernate-ucp", "hibernate-jcache", "hibernate-micrometer",

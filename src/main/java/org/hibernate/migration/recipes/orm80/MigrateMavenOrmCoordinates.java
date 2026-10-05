@@ -4,18 +4,14 @@ import org.hibernate.migration.recipes.table.SkippedMigrations;
 import org.hibernate.migration.recipes.xml.DescriptorVisitor;
 import org.jspecify.annotations.NonNull;
 import org.openrewrite.*;
-import org.openrewrite.maven.tree.MavenRepository;
-import org.openrewrite.maven.tree.GroupArtifactVersion;
-import org.openrewrite.maven.internal.MavenPomDownloader;
-import org.openrewrite.maven.MavenDownloadingException;
+
 import org.openrewrite.xml.XmlIsoVisitor;
 import org.openrewrite.xml.tree.Xml;
 import java.util.*;
-import java.util.regex.*;
 
 import static org.hibernate.migration.recipes.orm80.OrmCoordinateSupport.*;
 
-/// Relocates Maven ORM dependencies and tooling, with verified BOM-based version omission.
+/// Relocates Maven ORM dependencies and tooling.
 ///
 /// @author Steve Ebersole
 public class MigrateMavenOrmCoordinates extends Recipe {
@@ -27,7 +23,7 @@ public class MigrateMavenOrmCoordinates extends Recipe {
     // Relocated coordinates can expose declarations to earlier aggregate recipes.
     @Override public boolean causesAnotherCycle() { return true; }
     @Override public @NonNull String getDisplayName() { return "Migrate Maven ORM coordinates"; }
-    @Override public @NonNull String getDescription() { return "Aligns allowlisted Maven ORM dependencies and tooling and imports the Hibernate platform."; }
+    @Override public @NonNull String getDescription() { return "Aligns allowlisted Maven ORM dependencies and tooling."; }
     @Override public @NonNull Validated<Object> validate() { return super.validate().and(OrmCoordinateSupport.validate(targetVersion)); }
     private record Candidate(Xml.Tag tag, Xml.Tag scope, String role, String group, String artifact, String version, boolean namespaceSafe) {}
 
@@ -66,11 +62,6 @@ public class MigrateMavenOrmCoordinates extends Recipe {
         }
         Map<UUID, List<Candidate>> scopes = new LinkedHashMap<>();
         for (Candidate c : candidates) scopes.computeIfAbsent(c.scope.getId(), k -> new ArrayList<>()).add(c);
-        List<MavenRepository> repositories = new ArrayList<>();
-        children(doc.getRoot(), "repositories").forEach(t -> children(t, "repository").forEach(r -> {
-            String url = value(r, "url"); if (!url.isBlank() && !url.contains("${"))
-                repositories.add(MavenRepository.builder().id(value(r, "id")).uri(url).releases("true").snapshots("true").build());
-        }));
         Set<UUID> redundant = new HashSet<>(), entityConflicts = new HashSet<>();
         for (Candidate entity : candidates) if (entityManager(entity.artifact)) {
             List<Candidate> cores = candidates.stream().filter(c -> c.artifact.equals("hibernate-core")
@@ -84,8 +75,6 @@ public class MigrateMavenOrmCoordinates extends Recipe {
             else { entityConflicts.add(entity.tag.getId()); cores.forEach(c -> entityConflicts.add(c.tag.getId())); }
         }
         safeProperties.keySet().removeIf(reference -> candidates.stream().anyMatch(c -> entityConflicts.contains(c.tag.getId()) && value(c.tag, "version").equals(reference)));
-        Set<String> covered = candidates.stream().anyMatch(c -> c.role.equals("library"))
-                ? managed(targetVersion, repositories, ctx) : Set.of();
         for (List<Candidate> scope : scopes.values()) {
             List<Candidate> platforms = scope.stream().filter(c -> PLATFORM.equals(c.artifact)).toList();
             boolean platformConflict = platforms.size() > 1 || platforms.stream().anyMatch(c -> !c.role.equals("management")
@@ -99,9 +88,6 @@ public class MigrateMavenOrmCoordinates extends Recipe {
                     if (counts.merge(key, 1, Integer::sum) > 1) duplicate.add(key);
                 }
             }
-            boolean libraries = false;
-            boolean effective = !platformConflict && children(doc.getRoot(), "parent").isEmpty()
-                    && otherImportsClear(scope.get(0).scope, properties, repositories, covered, ctx);
             for (Candidate c : scope) {
                 if (redundant.contains(c.tag.getId())) continue;
                 String target = target(c.group, c.artifact);
@@ -116,42 +102,13 @@ public class MigrateMavenOrmCoordinates extends Recipe {
                     report(MigrateMavenOrmCoordinates.this, skipped, doc, positions.get(c.tag.getId()), c.group + ":" + c.artifact,
                             reason, "Resolve this Maven declaration manually before migration.", ctx); continue;
                 }
-                boolean omit = c.role.equals("library") && !TOOLING.contains(target) && effective && covered.contains(target)
-                        && value(c.tag, "classifier").isEmpty() && (value(c.tag, "type").isEmpty() || value(c.tag, "type").equals("jar"));
                 Xml.Tag updated = CoordinateXmlEdits.set(CoordinateXmlEdits.set(c.tag, "groupId", GROUP), "artifactId", target);
-                updated = omit ? CoordinateXmlEdits.remove(updated, "version") : CoordinateXmlEdits.set(updated, "version", safeProperties.containsKey(value(c.tag, "version")) ? value(c.tag, "version") : targetVersion);
-                if (!omit && safeProperties.containsKey(value(c.tag, "version"))) {
+                updated = CoordinateXmlEdits.set(updated, "version", safeProperties.containsKey(value(c.tag, "version")) ? value(c.tag, "version") : targetVersion);
+                if (safeProperties.containsKey(value(c.tag, "version"))) {
                     Xml.Tag property = safeProperties.get(value(c.tag, "version"));
                     replacements.put(property.getId(), property.withValue(targetVersion));
                 }
                 replacements.put(c.tag.getId(), updated);
-                if (c.role.equals("library") && !TOOLING.contains(target)) libraries = true;
-                if (c.role.equals("library") && !TOOLING.contains(target) && !omit && value(c.tag, "classifier").isEmpty()
-                        && (value(c.tag, "type").isEmpty() || value(c.tag, "type").equals("jar")))
-                    report(this, skipped, doc, positions.get(c.tag.getId()), GROUP + ":" + target, MANAGEMENT,
-                            "Coordinates aligned; explicit version retained because effective platform management could not be verified.", ctx);
-            }
-            if (libraries && !platformConflict && platforms.isEmpty()) {
-                Xml.Tag scopeTag = scope.get(0).scope;
-                Xml.Tag bom = Xml.Tag.build("<" + name(scopeTag, "dependency") + "><" + name(scopeTag, "groupId") + ">" + GROUP
-                        + "</" + name(scopeTag, "groupId") + "><" + name(scopeTag, "artifactId") + ">" + PLATFORM
-                        + "</" + name(scopeTag, "artifactId") + "><" + name(scopeTag, "version") + ">" + targetVersion
-                        + "</" + name(scopeTag, "version") + "><" + name(scopeTag, "type") + ">pom</" + name(scopeTag, "type")
-                        + "><" + name(scopeTag, "scope") + ">import</" + name(scopeTag, "scope") + "></" + name(scopeTag, "dependency") + ">");
-                List<Xml.Tag> management = children(scopeTag, "dependencyManagement");
-                Xml.Tag dm = management.isEmpty() ? Xml.Tag.build("<" + name(scopeTag, "dependencyManagement") + "><" + name(scopeTag, "dependencies")
-                        + "></" + name(scopeTag, "dependencies") + "></" + name(scopeTag, "dependencyManagement") + ">") : management.get(0);
-                List<Xml.Tag> dependencies = children(dm, "dependencies");
-                Xml.Tag deps = dependencies.isEmpty() ? Xml.Tag.build("<" + name(dm, "dependencies") + "></" + name(dm, "dependencies") + ">") : dependencies.get(0);
-                Xml.Tag withBom = CoordinateXmlEdits.append(deps, bom);
-                if (!dependencies.isEmpty()) replacements.put(deps.getId(), withBom);
-                else dm = CoordinateXmlEdits.append(dm, withBom);
-                if (!management.isEmpty()) { if (dependencies.isEmpty()) replacements.put(dm.getId(), dm); }
-                else {
-                    final Xml.Tag oldDeps = deps;
-                    dm = dm.withContent(dm.getContent().stream().map(t -> t.getId().equals(oldDeps.getId()) ? withBom : t).toList());
-                    replacements.put(scopeTag.getId(), CoordinateXmlEdits.append(scopeTag, dm));
-                }
             }
         }
         Xml.Document result = (Xml.Document) new XmlIsoVisitor<ExecutionContext>() {
@@ -160,26 +117,6 @@ public class MigrateMavenOrmCoordinates extends Recipe {
             }
         }.visitNonNull(doc, ctx);
         return result.printAll().equals(doc.printAll()) ? doc : result;
-    }
-
-    private boolean otherImportsClear(Xml.Tag scope, Map<String, String> props, List<MavenRepository> repositories, Set<String> covered, ExecutionContext ctx) {
-        for (Xml.Tag dm : children(scope, "dependencyManagement")) for (Xml.Tag dependencies : children(dm, "dependencies"))
-            for (Xml.Tag d : children(dependencies, "dependency")) {
-                if (!"import".equals(value(d, "scope")) || PLATFORM.equals(value(d, "artifactId"))) continue;
-                String group = resolve(value(d, "groupId"), props), artifact = resolve(value(d, "artifactId"), props), version = resolve(value(d, "version"), props);
-                if (group.isBlank() || artifact.isBlank() || !simpleVersion(version)) return false;
-                try {
-                    var downloader = new MavenPomDownloader(ctx);
-                    var other = downloader.download(new GroupArtifactVersion(group, artifact, version), null, null,
-                            repositories.isEmpty() ? List.of(MavenRepository.MAVEN_CENTRAL) : repositories).resolve(List.of(), downloader, ctx);
-                    for (String orm : covered) {
-                        String managedVersion = other.getManagedVersion(GROUP, orm, "jar", null);
-                        if (managedVersion != null && !managedVersion.equals(targetVersion)) return false;
-                    }
-                }
-                catch (MavenDownloadingException e) { return false; }
-            }
-        return true;
     }
     private static int referenceCount(Xml.Tag tag, String reference) {
         int count = tag.getValue().filter(v -> v.contains(reference)).isPresent() ? 1 : 0;

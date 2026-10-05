@@ -54,21 +54,12 @@ class OrmCoordinatesTest {
         assertEquals(input, outcome.files.get(path));
         assertTrue(outcome.rows.stream().anyMatch(r -> r.getReasonCode().equals(OrmCoordinateSupport.VERSION)));
     }
-    @Test void unavailablePlatformRetainsExplicitVersion(@org.junit.jupiter.api.io.TempDir Path emptyRepository) {
+    @ParameterizedTest @ValueSource(strings = {"build.gradle", "build.gradle.kts"})
+    void explicitVersionAlwaysRetained(String path) {
         String input = "dependencies { implementation(\"org.hibernate:hibernate-core:7.4.11.Final\") }\n";
-        // Populate the ordinary cache before proving an isolated repository still cannot resolve the BOM.
-        Outcome ordinary = run("build.gradle", input);
-        assertTrue(ordinary.files.get("build.gradle").contains("implementation(platform("));
-        assertFalse(ordinary.rows.stream().anyMatch(r -> r.getReasonCode().equals(OrmCoordinateSupport.MANAGEMENT)));
-        var ctx = new InMemoryExecutionContext(e -> { throw new AssertionError(e); });
-        org.openrewrite.maven.MavenExecutionContextView.view(ctx)
-                .setMirrors(List.of(new org.openrewrite.maven.tree.MavenRepositoryMirror("empty", emptyRepository.toUri().toString(), "*", true, false, null)))
-                .setAddLocalRepository(false).setAddCentralRepository(false);
-        SourceFile source = parse("build.gradle", input, ctx);
-        var result = new MigrateOrmCoordinates(TARGET).run(new InMemoryLargeSourceSet(List.of(source)), ctx);
-        String output = result.getChangeset().getAllResults().get(0).getAfter().printAll();
-        assertTrue(output.contains("org.hibernate.orm:hibernate-core:" + TARGET), output);
-        assertTrue(result.getDataTableRows(SkippedMigrations.class).stream().anyMatch(r -> r.getReasonCode().equals(OrmCoordinateSupport.MANAGEMENT)));
+        Outcome outcome = run(path, input);
+        assertTrue(outcome.files.get(path).contains("org.hibernate.orm:hibernate-core:" + TARGET), outcome.files.get(path));
+        assertFalse(outcome.files.get(path).contains("platform("), outcome.files.get(path));
     }
     @Test void enhancementAndCoordinateMigrationsCompose() {
         var ctx = RecipeExecutionContexts.standard(e -> { throw new AssertionError(e); });
@@ -86,9 +77,9 @@ class OrmCoordinatesTest {
     }
 
     @ParameterizedTest @ValueSource(strings = {"build.gradle", "build.gradle.kts"})
-    void gradleLibrariesProcessorsAndPlatform(String path) {
+    void gradleLibrariesAndProcessors(String path) {
         String input = "dependencies {\n    implementation(\"org.hibernate:hibernate-core:7.4.11.Final\")\n    annotationProcessor(\"org.hibernate.orm:hibernate-jpamodelgen:7.4.11.Final\")\n}\n";
-        String expected = "dependencies {\n    implementation(\"org.hibernate.orm:hibernate-core\")\n    annotationProcessor(\"org.hibernate.orm:hibernate-processor:" + TARGET + "\")\n    implementation(platform(\"org.hibernate.orm:hibernate-platform:" + TARGET + "\"))\n}\n";
+        String expected = "dependencies {\n    implementation(\"org.hibernate.orm:hibernate-core:" + TARGET + "\")\n    annotationProcessor(\"org.hibernate.orm:hibernate-processor:" + TARGET + "\")\n}\n";
         assertEquals(expected, run(path, input).files.get(path));
     }
     @ParameterizedTest @ValueSource(strings = {"build.gradle", "build.gradle.kts"})
@@ -97,14 +88,14 @@ class OrmCoordinatesTest {
         String output = run(path, input).files.get(path);
         assertTrue(output.contains("version \"" + TARGET + "\" apply false"), output);
         assertTrue(output.contains("enforcedPlatform(\"org.hibernate.orm:hibernate-platform:" + TARGET + "\")"), output);
-        assertTrue(output.contains("implementation(\"org.hibernate.orm:hibernate-core\")"), output);
+        assertTrue(output.contains("implementation(\"org.hibernate.orm:hibernate-core:" + TARGET + "\")"), output);
     }
     @Test void mavenScopeBomPluginAndProcessor() {
         String input = "<project><dependencies><dependency><groupId>org.hibernate</groupId><artifactId>hibernate-core</artifactId><version>7.4.11.Final</version></dependency></dependencies><build><plugins><plugin><groupId>org.hibernate.orm.tooling</groupId><artifactId>hibernate-enhance-maven-plugin</artifactId><version>7.4.11.Final</version><configuration><keep>true</keep></configuration></plugin></plugins></build></project>";
         String output = run("pom.xml", input).files.get("pom.xml");
-        assertTrue(output.contains("<artifactId>hibernate-core</artifactId></dependency>"), output);
+        assertTrue(output.contains("<artifactId>hibernate-core</artifactId><version>" + TARGET + "</version></dependency>"), output);
         assertTrue(output.contains("<artifactId>hibernate-maven-plugin</artifactId><version>" + TARGET + "</version>"), output);
-        assertTrue(output.contains("<type>pom</type><scope>import</scope>"), output);
+        assertFalse(output.contains("<type>pom</type><scope>import</scope>"), output);
         assertTrue(output.contains("<configuration><keep>true</keep></configuration>"));
     }
     @Test void ivyRevisionsAndConstraint() {
@@ -124,15 +115,15 @@ class OrmCoordinatesTest {
         assertTrue(output.contains("core = { module = \"org.hibernate.orm:hibernate-core\", version = \"" + TARGET + "\" }"), output);
         assertTrue(output.contains("validator = { module = \"org.hibernate.validator:hibernate-validator\", version.ref = \"orm\" }"), output);
         assertTrue(output.contains("hibernate = { id = \"org.hibernate.orm\", version = \"" + TARGET + "\" }"), output);
-        assertTrue(result.files.get("build.gradle").contains("implementation(platform("), result.files.toString());
+        assertFalse(result.files.get("build.gradle").contains("implementation(platform("), result.files.toString());
     }
     @ParameterizedTest @ValueSource(strings = {"build.gradle", "build.gradle.kts"})
     void catalogCompleteLocalConsumersOmitVersions(String path) {
         var output = run(Map.of("settings.gradle", "rootProject.name = 'example'\n", path,
                 "dependencies { implementation(libs.core) }\n", "gradle/libs.versions.toml",
                 "[libraries]\ncore = { module = \"org.hibernate:hibernate-core\", version = \"7.4.11.Final\" }\n")).files;
-        assertEquals("[libraries]\ncore = { module = \"org.hibernate.orm:hibernate-core\" }\n", output.get("gradle/libs.versions.toml"));
-        assertTrue(output.get(path).contains("implementation(platform("));
+        assertEquals("[libraries]\ncore = { module = \"org.hibernate.orm:hibernate-core\", version = \"" + TARGET + "\" }\n", output.get("gradle/libs.versions.toml"));
+        assertFalse(output.get(path).contains("implementation(platform("));
     }
     @ParameterizedTest @ValueSource(strings = {"build.gradle", "build.gradle.kts"})
     void namedNotationAndTrailingClosure(String path) {
@@ -141,7 +132,7 @@ class OrmCoordinatesTest {
         String input = "dependencies {\n    " + declaration + " { transitive = false }\n}\n";
         String output = run(path, input).files.get(path);
         assertTrue(output.contains("org.hibernate.orm"), output); assertFalse(output.contains("7.4.11.Final"), output);
-        assertFalse(output.contains("version =") || output.contains("version:"), output);
+        assertTrue(output.contains(TARGET), output);
         assertTrue(output.contains("transitive = false"), output);
     }
     @ParameterizedTest @ValueSource(strings = {"build.gradle", "build.gradle.kts"})
@@ -191,8 +182,8 @@ class OrmCoordinatesTest {
                 "implementation group: 'org.hibernate', name: 'hibernate-core', version: '7.4.11.Final'")) {
             String output = run("build.gradle", "dependencies { " + call + " }\n").files.get("build.gradle");
             assertTrue(output.contains("group: 'org.hibernate.orm'"), output);
-            assertFalse(output.contains("version:"), output);
-            assertTrue(output.contains("implementation(platform("), output);
+            assertTrue(output.contains(TARGET), output);
+            assertFalse(output.contains("implementation(platform("), output);
         }
     }
     @ParameterizedTest @ValueSource(strings = {"build.gradle", "build.gradle.kts"})
@@ -216,8 +207,7 @@ class OrmCoordinatesTest {
         String input = "<project><profiles><profile><id>extra</id><dependencies><dependency><groupId>org.hibernate</groupId><artifactId>hibernate-core</artifactId><version>7.4.11.Final</version><classifier>tests</classifier></dependency></dependencies></profile></profiles></project>";
         String output = run("pom.xml", input).files.get("pom.xml");
         assertTrue(output.contains("<artifactId>hibernate-core</artifactId><version>" + TARGET + "</version><classifier>tests</classifier>"), output);
-        assertTrue(output.contains("</dependencies><dependencyManagement>"), output);
-        assertTrue(output.contains("</dependencyManagement></profile>"), output);
+        assertFalse(output.contains("<dependencyManagement>"), output);
     }
     @Test void antPropertyOwnershipAndUnrelatedConsumer() {
         String input = "<project xmlns:m='antlib:org.apache.maven.artifact.ant'><property name='orm' value='7.4.11.Final'/><m:dependencies><dependency groupId='org.hibernate' artifactId='hibernate-core' version='${orm}'/></m:dependencies></project>";
@@ -290,7 +280,7 @@ class OrmCoordinatesTest {
         Outcome result = run(Map.of("settings.gradle", "rootProject.name = 'test'\n", path, "dependencies { implementation(libs.bundles.orm) }\n", "gradle/libs.versions.toml", catalog));
         String output = result.files.get("gradle/libs.versions.toml");
         assertFalse(output.contains("hibernate-entitymanager"), output);
-        assertTrue(output.contains("entity = { module = \"org.hibernate.orm:hibernate-core\" }"), output);
+        assertTrue(output.contains("entity = { module = \"org.hibernate.orm:hibernate-core\", version = \"" + TARGET + "\" }"), output);
         assertTrue(output.contains("orm = [\"entity\", \"core\"]"), output);
         assertTrue(result.files.get(path).contains("implementation(libs.bundles.orm)"));
         assertTrue(result.rows.isEmpty());
@@ -344,6 +334,25 @@ class OrmCoordinatesTest {
         assertEquals(input, result.files.get(path));
         assertEquals(2, result.rows.size());
         assertTrue(result.rows.stream().allMatch(r -> r.getReasonCode().equals(OrmCoordinateSupport.CONFLICT)));
+    }
+    @ParameterizedTest @ValueSource(strings = {"build.gradle", "build.gradle.kts", "pom.xml"})
+    void thirdPartyBomDoesNotTriggerHibernatePlatformInjection(String path) {
+        String input;
+        if (path.equals("pom.xml")) {
+            input = "<project><dependencyManagement><dependencies>"
+                    + "<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-dependencies</artifactId>"
+                    + "<version>3.4.0</version><type>pom</type><scope>import</scope></dependency>"
+                    + "</dependencies></dependencyManagement>"
+                    + "<dependencies><dependency><groupId>org.hibernate</groupId><artifactId>hibernate-core</artifactId></dependency></dependencies></project>";
+        }
+        else {
+            input = "dependencies {\n    implementation(platform(\"org.springframework.boot:spring-boot-dependencies:3.4.0\"))\n    implementation(\"org.hibernate:hibernate-core\")\n}\n";
+        }
+        Outcome result = run(path, input);
+        String output = result.files.get(path);
+        assertFalse(output.contains("hibernate-platform"), output);
+        assertTrue(output.contains("org.hibernate.orm"), output);
+        assertTrue(output.contains("spring-boot-dependencies"), output);
     }
     @Test void rejectedOptionsAndUnrelatedArtifacts() {
         for (String version : Arrays.asList(null, "", "8.+", "${orm}", "9.0.0.Final", "8.0.0-SNAPSHOT")) assertFalse(new MigrateOrmCoordinates(version).validate().isValid());
